@@ -58,7 +58,7 @@ struct SubgroupParams {
 struct SubgroupCostModel {
   SubgroupCostModel(const SubgroupParams &params, AffineParallelOp op)
       : params(params), op(op) {
-    bestCost = std::numeric_limits<double>::infinity();
+    bestCost = -std::numeric_limits<double>::infinity();
     // Tile accumulations only works on parallel loops with a single result
     if (op.getNumResults() != 1) {
       return;
@@ -127,9 +127,12 @@ struct SubgroupCostModel {
   void computeCostRecursive(unsigned idx) {
     if (idx == ranges.size()) {
       auto cost = computeCost();
-      if (cost < bestCost) {
+      if (cost > bestCost) {
         bestCost = cost;
         bestPlan = plan;
+
+        IVLOG(1, "current best cost = " << bestCost);
+        IVLOG(1, "current best plan = " << plan);
       }
       return;
     }
@@ -190,27 +193,53 @@ struct SubgroupCostModel {
       auto mi = computeMemoryInfo(si);
       // It is illegal for any access to be subgrouped on two indexes
       if (mi.subgroupCount > 1) {
-        return std::numeric_limits<double>::infinity();
+        return -std::numeric_limits<double>::infinity();
       }
       // Output (i.e. write) must be subgrouped on at least one index
       if (i == 0 && mi.subgroupCount == 0) {
-        return std::numeric_limits<double>::infinity();
+        return -std::numeric_limits<double>::infinity();
       }
 
       totMemory += mi.memSize;
       IVLOG(3, "tomMemory += " << mi.memSize);
     }
-    if (totMemory > params.maxRegsPerThread) {
-      IVLOG(3,
-            "Invalid subgroup plan: " << plan << ", totMemory = " << totMemory);
-      return std::numeric_limits<double>::infinity();
-    }
-    IVLOG(3, "Valid subgroup plan: " << plan << ", totMemory = " << totMemory);
+    // if (totMemory > params.maxRegsPerThread) {
+    //  IVLOG(3,
+    //        "Invalid subgroup plan: " << plan << ", totMemory = " <<
+    //        totMemory);
+    //  return -std::numeric_limits<double>::infinity();
+    //}
+    IVLOG(1, "Valid subgroup plan: " << plan << ", totMemory = " << totMemory);
     int64_t groups = 1;
     for (size_t i = 0; i < ranges.size(); i++) {
       groups *= ranges[i] / plan.innerTile[i];
     }
-    return static_cast<double>(groups * plan.subgroupSize);
+
+    double memPerTile = static_cast<double>(totMemory);
+    IVLOG(1, "memPerTile = " << memPerTile);
+
+    double compPerTile = 1.0;
+    for (auto inner : plan.innerTile) {
+      compPerTile *= static_cast<double>(inner);
+    }
+    IVLOG(1, "compPerTile = " << compPerTile);
+
+    double workGroupCount = static_cast<double>(groups);
+    IVLOG(1, "workGroupCount = " << workGroupCount);
+
+    double kRoofline = 15.44;
+    double rooflineRatio =
+        std::min(compPerTile / memPerTile, kRoofline) / kRoofline;
+    IVLOG(1, "rooflineRatio = " << rooflineRatio);
+
+    double kMaxWorkgroups = 65856.0;
+    double workgroupRatio =
+        std::min(workGroupCount, kMaxWorkgroups) / kMaxWorkgroups;
+    IVLOG(1, "workgroupRatio = " << workgroupRatio);
+
+    double goodness = rooflineRatio * workgroupRatio;
+    IVLOG(1, "GOODNESS = " << goodness);
+    return goodness;
   }
 
   // The parameters to the cost model
@@ -266,14 +295,14 @@ struct SubgroupsPass : public SubgroupsBase<SubgroupsPass> {
         40,      // Maximum register per thread
     };
     SubgroupCostModel cm(params, op);
-    if (cm.bestCost == std::numeric_limits<double>::infinity()) {
+    if (cm.bestCost == -std::numeric_limits<double>::infinity()) {
       // If subgrouping fails, we tile accumulations instead to handle the other
       // cases
       tileAccumulations(op, false);
       setIntegerTag(op, subgroupSizeTag(), 1);
       return;
     }
-    IVLOG(2, "best plan = " << cm.bestPlan);
+    IVLOG(1, "best plan = " << cm.bestPlan);
     SubgroupApply(op, cm.bestPlan);
   }
 };
